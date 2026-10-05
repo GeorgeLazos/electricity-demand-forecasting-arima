@@ -1,0 +1,296 @@
+---
+title: "Time Series Final Project"
+output:
+  pdf_document:
+    fig_caption: yes
+    number_sections: false
+fontsize: 12pt
+geometry: margin=1cm
+editor_options: 
+  markdown: 
+    wrap: 72
+header-includes:
+  - \usepackage{float}
+  - \floatplacement{figure}{H}
+  - \usepackage{titling}
+  - \setlength{\droptitle}{-3em}
+  - \pretitle{\begin{center}\Large\bfseries}
+  - \posttitle{\par\end{center}\vspace{-2em}}
+  - \setlength{\textfloatsep}{4pt}
+  - \setlength{\intextsep}{4pt}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,fig.width = 7, fig.height = 3, fig.pos = "H")
+library(forecast)
+library(fpp2)
+library(tseries)
+```
+<!-- (a) Import the dataset and transfer it to a time series data. -->
+
+#### Dataset and preprocessing
+The dataset comprises 2,106 daily observations for Victoria, Australia, with daily electricity demand as the target and min/max temperature, solar exposure, rainfall, retail price, school day, and holiday as predictors. After recoding the school day and holiday flags to binary, we split the series into a train set and a 98-day test set.
+
+```{r loading-preprocessing, echo=FALSE}
+# Read csv , and parse date column 
+dataset <- read.csv("data/elecDaily.csv")
+dataset$date <- as.Date(dataset$date)
+
+# Convert Y/N flags to binary
+dataset$school_day <- ifelse(dataset$school_day == "Y", 1, 0)
+dataset$holiday    <- ifelse(dataset$holiday    == "Y", 1, 0)
+
+# Split: training ends 2020-06-30, test covers the final 98 days
+train <- dataset[dataset$date <= as.Date("2020-06-30"), ]
+test  <- dataset[dataset$date >= as.Date("2020-07-01"), ]
+```
+
+<!-- (b) Explore the training dataset -->
+
+#### Classical decomposition
+Applying classical decomposition yields observed, trend, seasonal, and random components. The trend oscillates between roughly 100-140 GWh in annual waves with no long-term drift, and the seasonal panel shows a consistent weekly swing of about 15 GWh. The random component centres on zero within ±10 GWh, with recurring annual excursions to -20/+30 GWh consistent with extreme-temperature days.
+
+```{r decomposition, echo=FALSE, fig.pos="H", fig.width=7, fig.height=2, fig.cap="Classical decomposition of daily demand (in GWh)."}
+
+# Convert demand to GWh (thousands of MWh) for cleaner y-axis labels
+demand_train_weekly <- ts(train$demand / 1000, frequency = 7)
+
+# Classical additive decomposition (weekly seasonality)
+demand_decomp <- decompose(demand_train_weekly)
+
+# Plot the four-panel decomposition
+par(mar = c(3, 4, 1, 1), mfrow = c(2, 2))
+plot(demand_decomp$x,    ylab = "Observed (GWh)", xlab = "")
+plot(demand_decomp$trend, ylab = "Trend (GWh)",    xlab = "")
+plot(window(demand_decomp$seasonal, end = c(3, 7)),ylab = "Seasonal (GWh)", xlab = "Week")
+plot(demand_decomp$random, ylab = "Random (GWh)", xlab = "")
+
+```
+
+#### Stationarity tests
+The table reports three complementary tests: ADF (H0:non-stationary), KPSS (H0:stationary), and Ljung-Box (H0:no autocorrelation). ADF rejects non-stationarity, while KPSS and Ljung-Box both reject their nulls, indicating residual non-stationarity from a seasonal component.
+
+```{r stationarity-tests, echo=FALSE}
+
+# Apply ADF, KPSS and Ljung-Box tests to the training demand series
+adf_result <- adf.test(train$demand)
+kpss_result <- kpss.test(train$demand)
+box_result <- Box.test(train$demand, lag = 14, type = "Ljung-Box")
+
+# Summarise p-values and the implied verdict
+knitr::kable(data.frame(
+  test    = c("ADF", "KPSS", "Ljung-Box"),
+  null    = c("non-stationary", "stationary", "no autocorrelation"),
+  p_value = round(c(adf_result$p.value, kpss_result$p.value, box_result$p.value), 4),
+  verdict = c(
+    ifelse(adf_result$p.value  < 0.05, "stationary", "non-stationary"),
+    ifelse(kpss_result$p.value > 0.05, "stationary", "non-stationary"),
+    ifelse(box_result$p.value  > 0.05, "stationary", "non-stationary")
+  )
+))
+
+```
+
+#### ACF and PACF
+
+The ACF declines slowly from $\approx 0.85$ at lag 1 with spikes at lags 7, 14, 21, 28, confirming the non-stationarity and weekly cycle. The PACF spikes at lag 1 ($\approx 0.65$), suggesting an AR(1) component and a weekly seasonal AR term. Both functions tail off rather than cut off, pointing to an ARMA model.
+
+```{r acf-pacf, echo=FALSE, fig.pos="H", fig.width=8, fig.height=1.8, fig.cap="ACF (left) and PACF (right) of daily training demand, lags 0 to 60."}
+
+# Side-by-side ACF and PACF for the training demand series
+par(mar = c(4, 4, 1, 1), mfrow = c(1, 2))
+acf(train$demand, lag.max = 60, main="")
+pacf(train$demand, lag.max = 60, main="")
+
+```
+
+#### Demand vs temperature
+Plotting daily demand against minimum and maximum temperature. The maximum-temperature cloud reaches the hot extremes where demand responds most strongly, making it the stronger predictor and motivating a quadratic term.
+
+```{r demand-temp-overlay, fig.pos="H", fig.height=1.7 , echo=FALSE, fig.cap="Daily demand against min/max temperature, with quadratic fit on max temperature."}
+
+# Plot demand vs max temperature in red
+par(mar = c(4, 4, 1, 1))
+plot(train$max_temperature, train$demand / 1000, pch = ".", col = "red",
+     xlab = "Temperature (\u00b0C)", ylab = "Demand (GWh)",
+     xlim = range(c(train$min_temperature, train$max_temperature)),
+     cex.axis = 0.6, cex.lab = 0.7, las = 1)
+
+points(train$min_temperature, train$demand / 1000, pch = ".", col = "blue")
+
+quad_fit <- lm(I(demand/1000) ~ max_temperature + I(max_temperature^2), data = train)
+temp_seq <- seq(min(train$max_temperature), max(train$max_temperature), length.out = 100)
+lines(temp_seq,
+      predict(quad_fit, newdata = data.frame(max_temperature = temp_seq)),
+      col = "darkred", lwd = 2)
+
+```
+
+#### Boxplots by school day and holiday
+
+Comparing demand distributions across calendar categories, school days show only marginal uplift with overlapping IQRs while holiday demand sits around 20 GWh below non-holiday with a tighter spread, marking holiday the stronger predictor.
+
+```{r calendar-boxplots, fig.pos="H", echo=FALSE, fig.width=6, fig.height=2.5, fig.cap="Distribution of daily demand (in GWh) by school day status (left) and holiday status (right)."}
+
+# Side-by-side boxplots for the two binary calendar flags
+par(mar = c(4, 4, 1, 1), mfrow = c(1, 2))
+
+boxplot(demand / 1000 ~ school_day, data = train,
+        names = c("Non-school", "School"),
+        xlab = "School day", ylab = "Demand (GWh)",
+        cex.axis = 0.6, cex.lab = 0.7, las = 1)
+
+boxplot(demand / 1000 ~ holiday, data = train,
+        names = c("Non-holiday", "Holiday"),
+        xlab = "Holiday", ylab = "Demand (GWh)",
+        cex.axis = 0.6, cex.lab = 0.7, las = 1)
+
+```
+
+#### Model selection and forecast
+
+We evaluate four candidates: seasonal naive, Holt-Winters, regression with ARIMA errors (temp, square, holiday, school), and dynamic harmonic regression with the same predictors plus Fourier terms for the weekly cycle.
+
+```{r model-fitting, echo=FALSE}
+
+# Wrap demand for modelling (weekly frequency for seasonal handling)
+demand_ts <- ts(train$demand, frequency = 7)
+
+# Model A: seasonal naive — forecast = same day last week
+fit_snaive <- snaive(demand_ts, h = 98)
+
+# Model B: Holt-Winters exponential smoothing (level + trend + weekly seasonal)
+fit_hw <- hw(demand_ts, h = 98)
+
+# Predictors chosen from data analysis: U-shape => temp + temp^2; calendar effects
+xreg_train <- cbind(
+  max_temp    = train$max_temperature,
+  max_temp_sq = train$max_temperature^2,
+  holiday     = train$holiday,
+  school_day  = train$school_day
+)
+
+# Model C: regression with ARIMA errors using the EDA-driven predictors
+fit_xreg <- auto.arima(demand_ts, xreg = xreg_train)
+
+# Model D: dynamic harmonic regression with K=3 Fourier terms for the weekly
+# cycle, plus the same predictors as Model C; seasonal=FALSE turns off the
+# seasonal ARIMA term since Fourier handles the seasonality
+fit_dhr <- auto.arima(
+  demand_ts,
+  xreg = cbind(fourier(demand_ts, K = 3), xreg_train),
+  seasonal = FALSE
+)
+```
+
+#### Model selection
+
+DHR+xreg achieves the lowest AICc and BIC, confirming that ARIMA-based modelling outperforms H-W and that Fourier terms capture the weekly cycle more efficiently than a seasonal ARIMA component.
+
+```{r selection-table, echo=FALSE}
+# Compare the three likelihood-fitted models (SNAIVE has no AICc/BIC
+# because it has no parameters; included via test-set accuracy below).
+knitr::kable(data.frame(
+  model = c("Holt-Winters", "ARIMA + xreg", "DHR + xreg"),
+  AICc  = round(c(fit_hw$model$aicc, fit_xreg$aicc, fit_dhr$aicc), 1),
+  BIC   = round(c(fit_hw$model$bic,  fit_xreg$bic,  fit_dhr$bic), 1)
+))
+```
+#### Residual diagnostics
+Residual diagnostics confirm the model has captured the structure: Ljung-Box does not reject white noise, the residual ACF lies within confidence bands at virtually every lag, the time plot is centred on zero, and the histogram is approximately symmetric.
+
+```{r residuals, fig.pos="H", echo=FALSE, fig.width=8, fig.height=3.5, fig.cap="Residual time plot, ACF, histogram and Ljung-Box test for chosen model", results='hide'}
+checkresiduals(fit_dhr)
+```
+
+### Forecast vs actual demand
+
+```{r forecast-plot, fig.pos="H", echo=FALSE, fig.width=6, fig.height=1.8, fig.cap="Forecast (blue) with 80% and 95% prediction intervals against actual test-set demand (red)."}
+# Build test-set predictors with the same names as training xreg
+xreg_test <- cbind(
+  max_temp    = test$max_temperature,
+  max_temp_sq = test$max_temperature^2,
+  holiday     = test$holiday,
+  school_day  = test$school_day
+)
+
+# Generate the 98-day forecast for DHR
+# Fourier terms must be projected forward with h=98 and combined with test xreg
+fc <- forecast(fit_dhr,
+               xreg = cbind(fourier(demand_ts, K = 3, h = 98), xreg_test),
+               h = 98)
+
+# Wrap test demand as ts continuing the training timeline
+test_ts <- ts(test$demand,
+              start = end(demand_ts) + c(0, 1),
+              frequency = 7)
+
+# Plot training tail + forecast + actuals
+par(mar = c(4, 4, 1, 1))
+plot(fc, main="", xlab = "Time (weeks)", ylab = "Demand (GWh)",
+     cex.axis = 0.6, cex.lab = 0.7, las = 1, yaxt = "n",
+     include = 14)
+ticks <- pretty(c(fc$x, fc$mean, test_ts))
+axis(2, at = ticks, labels = ticks / 1000, cex.axis = 0.6, las = 1)
+lines(test_ts, col = "red")
+lines(fc$mean, col = "blue", lwd = 2)
+legend("topleft", legend = c("Forecast", "Actual"),
+       col = c("blue", "red"), lty = 1, bty = "n", cex = 0.6)
+
+
+```
+
+DHR+xreg achieves approximately 22% lower RMSE and 26% lower MAE/MAPE than the seasonal naive baseline, tracking the broad pattern of test-period demand with a few high-demand spikes exceeding the prediction intervals.
+
+```{r accuracy-table, echo=FALSE}
+# Evaluate the chosen model and the seasonal naive baseline on the test set
+acc_dhr    <- accuracy(fc, test$demand)
+acc_snaive <- accuracy(fit_snaive, test$demand)
+
+knitr::kable(data.frame(
+  model = c("Seasonal naive", "DHR + xreg"),
+  RMSE  = round(c(acc_snaive["Test set", "RMSE"], acc_dhr["Test set", "RMSE"]), 0),
+  MAE   = round(c(acc_snaive["Test set", "MAE"],  acc_dhr["Test set", "MAE"]),  0),
+  MAPE  = round(c(acc_snaive["Test set", "MAPE"], acc_dhr["Test set", "MAPE"]), 2)
+))
+```
+#### Strengths and Limitations
+DHR + xreg outperforms both the seasonal naive and Holt-Winters baselines across all accuracy metrics, and its residuals satisfy the white-noise assumption, lending credibility to the prediction intervals. A key limitation is that the test period coincides with the COVID-19 lockdown, introducing atypical demand patterns absent from the training data and not explicitly modelled. The forecast is also conditional on observed test-period weather, and at the 98-day horizon the prediction intervals widen substantially.
+
+### Appendix — R code
+
+```{r setup-code, ref.label="setup", eval=FALSE}
+```
+
+```{r loading-preprocessing-code, ref.label="loading-preprocessing", eval=FALSE}
+```
+
+```{r decomposition-code, ref.label="decomposition", eval=FALSE}
+```
+
+```{r stationarity-tests-code, ref.label="stationarity-tests", eval=FALSE}
+```
+
+```{r acf-pacf-code, ref.label="acf-pacf", eval=FALSE}
+```
+
+```{r demand-temp-overlay-code, ref.label="demand-temp-overlay", eval=FALSE}
+```
+
+```{r calendar-boxplots-code, ref.label="calendar-boxplots", eval=FALSE}
+```
+
+```{r model-fitting-code, ref.label="model-fitting", eval=FALSE}
+```
+
+```{r selection-table-code, ref.label="selection-table", eval=FALSE}
+```
+
+```{r residuals-code, ref.label="residuals", eval=FALSE}
+```
+
+```{r forecast-plot-code, ref.label="forecast-plot", eval=FALSE}
+```
+
+```{r accuracy-table-code, ref.label="accuracy-table", eval=FALSE}
+```

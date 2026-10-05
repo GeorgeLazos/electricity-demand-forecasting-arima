@@ -1,0 +1,13 @@
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+*.Rproj
+brief/
+CLAUDE.md
+report_files/
+report.tex
+report.knit.md
+report.log
+
+data/
